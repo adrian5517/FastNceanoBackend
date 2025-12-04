@@ -1,14 +1,97 @@
 import Student from '../models/Student.js';
 import Visit from '../models/Visit.js';
 
-// Helper to parse QR payload (tries JSON then raw string)
+// Helper to collapse repeated characters
+function collapseRepeats(s) {
+  return String(s).replace(/(.)\1+/g, '$1');
+}
+
+// Helper to parse QR payload (tries JSON then raw string) and normalize keys/values
 function parseQR(qr) {
   if (!qr) return {};
-  try {
-    return JSON.parse(qr);
-  } catch (e) {
-    return { raw: qr };
+
+  // Normalize parsed object's keys/values in case keys contain repeated chars (scanner noise)
+  function normalizeParsed(obj) {
+    if (!obj || typeof obj !== 'object') return obj;
+    const out = {};
+    Object.keys(obj).forEach((k) => {
+      try {
+        const rawVal = obj[k];
+        const nk = collapseRepeats(k).toLowerCase().replace(/[^a-z0-9]/g, '');
+        let mappedKey = nk;
+        if (nk.includes('studentno') || (nk.includes('student') && nk.includes('no'))) mappedKey = 'studentNo';
+        else if (nk === 'student') mappedKey = 'studentNo';
+        else if (nk.includes('id') || nk.includes('studentid')) mappedKey = 'id';
+
+        let newVal = rawVal;
+        if (typeof rawVal === 'string') {
+          newVal = collapseRepeats(rawVal);
+          newVal = newVal.replace(/[-_]{2,}/g, '-').replace(/\s{2,}/g, ' ').trim();
+          newVal = newVal.replace(/^[:"'\s\{\}]+|[:"'\s\{\}]+$/g, '');
+        } else if (typeof rawVal === 'object') {
+          newVal = normalizeParsed(rawVal);
+        }
+
+        out[mappedKey] = newVal;
+      } catch (err) {
+        out[k] = obj[k];
+      }
+    });
+    return out;
   }
+
+  // Try JSON.parse first (raw incoming may be JSON-like)
+  try {
+    const parsed = JSON.parse(qr);
+    return normalizeParsed(parsed);
+  } catch (e) {}
+
+  // Lightweight cleanup and try parse again
+  const s = String(qr);
+  let cleaned = s.replace(/\{\{+/g, '{').replace(/\}\}+/g, '}');
+  cleaned = cleaned.replace(/::+/g, ':').replace(/,,+/g, ',').replace(/""+/g, '"');
+  try {
+    const parsed2 = JSON.parse(cleaned);
+    return normalizeParsed(parsed2);
+  } catch (e) {}
+
+  // Try to fuzzy-extract common keys from raw string
+  const tryExtractFuzzyValue = (raw, key) => {
+    const lower = String(raw).toLowerCase();
+    const k = key.toLowerCase();
+    const idx = lower.indexOf(k[0]);
+    if (idx === -1) return null;
+    // simple heuristic: find ':' after key-like sequence
+    const colon = lower.indexOf(':', idx);
+    if (colon === -1) return null;
+    let j = colon + 1;
+    while (j < raw.length && (raw[j] === ' ' || raw[j] === ':' || raw[j] === '\\' || raw[j] === '"')) j++;
+    let end = j;
+    while (end < raw.length && raw[end] !== ',' && raw[end] !== '}') end++;
+    let val = raw.slice(j, end).trim();
+    val = val.replace(/^[:"'\s\{\}]+|[:"'\s\{\}]+$/g, '');
+    if (!val) return null;
+    return collapseRepeats(val);
+  };
+
+  const keys = ['studentno', 'student_no', 'id', 'studentid', 'student'];
+  for (const k of keys) {
+    const v = tryExtractFuzzyValue(s, k);
+    if (v) {
+      if (k.includes('id')) return { id: v };
+      return { studentNo: v };
+    }
+  }
+
+  // Fallback: pick longest alphanumeric token
+  const tokens = s.match(/[A-Za-z0-9\-]{4,}/g) || [];
+  if (tokens.length) {
+    let candidate = tokens.find(t => /[A-Za-z]/.test(t) && /\d/.test(t)) || tokens.sort((a,b)=>b.length-a.length)[0];
+    candidate = collapseRepeats(candidate);
+    return { studentNo: candidate };
+  }
+
+  return { raw: qr };
 }
 
 export async function scanAttendance(req, res) {
@@ -17,11 +100,45 @@ export async function scanAttendance(req, res) {
   const payload = parseQR(qr);
   console.log('[attendance] parsed payload:', payload);
 
-  // Try to find student by id or studentNo
+  // Try to find student by id or studentNo with tolerant matching
   let student = null;
-  if (payload.id) student = await Student.findById(payload.id).exec();
-  if (!student && payload.studentNo) student = await Student.findOne({ studentNo: payload.studentNo }).exec();
-  if (!student && payload.raw) student = await Student.findOne({ studentNo: payload.raw }).exec();
+  function escapeRegExp(str) {
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  if (payload.id) {
+    try { student = await Student.findById(payload.id).exec(); } catch (e) { student = null; }
+  }
+
+  const tryStudentNoLookups = async (sn) => {
+    if (!sn) return null;
+    let s = await Student.findOne({ studentNo: sn }).exec();
+    if (s) return s;
+    const collapsed = collapseRepeats(sn);
+    s = await Student.findOne({ studentNo: collapsed }).exec();
+    if (s) return s;
+    const stripped = sn.replace(/[^a-zA-Z0-9]/g, '');
+    s = await Student.findOne({ studentNo: stripped }).exec();
+    if (s) return s;
+    const collapsedStripped = collapsed.replace(/[^a-zA-Z0-9]/g, '');
+    s = await Student.findOne({ studentNo: collapsedStripped }).exec();
+    if (s) return s;
+    if (collapsedStripped && collapsedStripped.length >= 4) {
+      const pattern = collapsedStripped.split('').map(c => escapeRegExp(c) + '+').join('\\W*');
+      try {
+        s = await Student.findOne({ studentNo: { $regex: pattern, $options: 'i' } }).exec();
+        if (s) return s;
+      } catch (e) {}
+    }
+    return null;
+  };
+
+  if (!student && payload.studentNo) {
+    student = await tryStudentNoLookups(payload.studentNo);
+  }
+  if (!student && payload.raw) {
+    student = await tryStudentNoLookups(payload.raw);
+  }
 
   if (!student) {
     console.warn('[attendance] student not found for payload:', payload);
