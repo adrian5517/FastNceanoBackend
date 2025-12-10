@@ -1,5 +1,6 @@
 import Student from '../models/Student.js';
 import Visit from '../models/Visit.js';
+import { broadcastActivity } from '../utils/activityStream.js';
 
 // Helper to collapse repeated characters
 function collapseRepeats(s) {
@@ -178,6 +179,26 @@ export async function timeIn(req, res) {
     console.warn('Failed to update embedded visits for student (non-fatal)', e);
   }
 
+  // Broadcast new activity to any connected SSE clients
+  try {
+    broadcastActivity({
+      type: 'IN',
+      session: visitDoc,
+      student: {
+        _id: String(student._id),
+        studentNo: student.studentNo,
+        firstName: student.firstName,
+        lastName: student.lastName,
+        photo: student.photo,
+        level: student.level,
+        course: student.course
+      },
+      timestamp: now
+    });
+  } catch (e) {
+    console.warn('broadcastActivity failed on timeIn', e);
+  }
+
   return res.json({ message: 'Time In recorded', session: visitDoc, studentId: student._id });
 }
 
@@ -210,6 +231,25 @@ export async function timeOut(req, res) {
 
     const session = activeVisit;
     const durationMs = new Date(session.timeOut) - new Date(session.timeIn);
+
+    // Broadcast time-out activity
+    try {
+      broadcastActivity({
+        type: 'OUT',
+        session: session,
+        student: {
+          _id: String(student._id),
+          studentNo: student.studentNo,
+          firstName: student.firstName,
+          lastName: student.lastName,
+          photo: student.photo
+        },
+        durationMs,
+        timestamp: session.timeOut
+      });
+    } catch (e) {
+      console.warn('broadcastActivity failed on timeOut', e);
+    }
     return res.json({ message: 'Time Out recorded', session: { ...session._doc || session }, durationMs, studentId: student._id });
   }
 

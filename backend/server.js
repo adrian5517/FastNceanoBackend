@@ -8,6 +8,7 @@ import studentsRoutes from './routes/students.js';
 import exportRoutes from './routes/export.js';
 import attendanceRoutes from './routes/attendance.js';
 import adminRoutes from './routes/admin.js';
+import { sseHandler } from './utils/activityStream.js';
 
 dotenv.config();
 
@@ -30,6 +31,9 @@ app.use('/api/students', studentsRoutes);
 app.use('/api/export', exportRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/admin', adminRoutes);
+
+// Server-Sent Events stream for live activity
+app.get('/api/activities/stream', sseHandler);
 
 app.get('/', (req, res) => {
   res.send('FastNCeano Backend Running');
